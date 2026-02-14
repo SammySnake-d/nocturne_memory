@@ -1018,9 +1018,8 @@ class Neo4jClient:
 
         deleted_relay_count = 0
         if relay_count > 0 and force:
-            # 级联删除所有关联的2跳边（通过统一的delete_relay_edge逻辑）
-            for r_edge_id in relay_edge_ids:
-                Neo4jClient._delete_relay_edge_tx(tx, r_edge_id)
+            # 级联删除所有关联的2跳边（通过批量逻辑，避免N+1查询）
+            Neo4jClient._delete_relay_edges_batch_tx(tx, relay_edge_ids)
             deleted_relay_count = len(relay_edge_ids)
 
         # 删除1跳边
@@ -1328,6 +1327,21 @@ class Neo4jClient:
             "relation": relation,
             "created_at": str(record["created_at"])
         }
+
+    @staticmethod
+    def _delete_relay_edges_batch_tx(tx, edge_ids: List[str]):
+        """
+        批量删除指定的2跳边：删除所有 edge_ids 匹配的 RELAY_EDGE
+        """
+        if not edge_ids:
+            return
+
+        delete_query = """
+        UNWIND $edge_ids AS edge_id
+        MATCH ()-[r:RELAY_EDGE {edge_id: edge_id}]-()
+        DELETE r
+        """
+        tx.run(delete_query, edge_ids=edge_ids)
 
     def delete_relay_edge(self, edge_id: str) -> Dict[str, Any]:
         """
