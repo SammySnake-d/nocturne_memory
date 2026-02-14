@@ -1308,6 +1308,36 @@ class SQLiteClient:
             "deprecated": row.deprecated,
             "paths": paths,
         }
+        current_id = start_id
+        for _ in range(max_hops):
+            result = await session.execute(
+                select(Memory).where(Memory.id == current_id)
+            )
+            memory = result.scalar_one_or_none()
+            if not memory:
+                return None  # Broken chain
+            if memory.migrated_to is None:
+                # Final target reached
+                paths_result = await session.execute(
+                    select(Path).where(Path.memory_id == memory.id)
+                )
+                paths = [f"{p.domain}://{p.path}" for p in paths_result.scalars().all()]
+                return {
+                    "id": memory.id,
+                    "content": memory.content,
+                    "content_snippet": (
+                        memory.content[:200] + "..."
+                        if len(memory.content) > 200
+                        else memory.content
+                    ),
+                    "created_at": (
+                        memory.created_at.isoformat() if memory.created_at else None
+                    ),
+                    "deprecated": memory.deprecated,
+                    "paths": paths,
+                }
+            current_id = memory.migrated_to
+        return None  # Chain too long, likely a cycle
 
     async def get_all_orphan_memories(self) -> List[Dict[str, Any]]:
         """
