@@ -17,7 +17,7 @@ import re
 import sys
 import uuid
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional
 from dotenv import load_dotenv, find_dotenv
 
 # Ensure we can import from backend modules
@@ -26,6 +26,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import FastMCP
 from db.sqlite_client import get_sqlite_client
 from db.snapshot import get_snapshot_manager
+import view
+from utils.uri import parse_uri, make_uri, VALID_DOMAINS, DEFAULT_DOMAIN
 
 # Load environment variables
 # Explicitly look for .env in the parent directory (project root)
@@ -43,17 +45,6 @@ else:
 
 # Initialize FastMCP server
 mcp = FastMCP("Nocturne Memory Interface")
-
-# =============================================================================
-# Domain Configuration
-# =============================================================================
-# Valid domains (protocol prefixes)
-# =============================================================================
-VALID_DOMAINS = [
-    d.strip()
-    for d in os.getenv("VALID_DOMAINS", "core,writer,game,notes,system").split(",")
-]
-DEFAULT_DOMAIN = "core"
 
 # =============================================================================
 # Core Memories Configuration
@@ -76,66 +67,6 @@ _SESSION_ID = f"mcp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex
 def get_session_id() -> str:
     """Get the current session ID for snapshot tracking."""
     return _SESSION_ID
-
-
-# =============================================================================
-# URI Parsing
-# =============================================================================
-
-# Regex pattern for URI: domain://path
-_URI_PATTERN = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_]*)://(.*)$")
-
-
-def parse_uri(uri: str) -> Tuple[str, str]:
-    """
-    Parse a memory URI into (domain, path).
-
-    Supported formats:
-    - "core://agent"          -> ("core", "agent")
-    - "writer://chapter_1"         -> ("writer", "chapter_1")
-    - "nocturne"              -> ("core", "nocturne")  [legacy fallback]
-
-    Args:
-        uri: The URI to parse
-
-    Returns:
-        Tuple of (domain, path)
-
-    Raises:
-        ValueError: If the URI format is invalid or domain is unknown
-    """
-    uri = uri.strip()
-
-    match = _URI_PATTERN.match(uri)
-    if match:
-        domain = match.group(1).lower()
-        path = match.group(2).strip("/")
-
-        if domain not in VALID_DOMAINS:
-            raise ValueError(
-                f"Unknown domain '{domain}'. Valid domains: {', '.join(VALID_DOMAINS)}"
-            )
-
-        return (domain, path)
-
-    # Legacy fallback: bare path without protocol
-    # Assume default domain (core)
-    path = uri.strip("/")
-    return (DEFAULT_DOMAIN, path)
-
-
-def make_uri(domain: str, path: str) -> str:
-    """
-    Create a URI from domain and path.
-
-    Args:
-        domain: The domain (e.g., "core", "writer")
-        path: The path (e.g., "nocturne")
-
-    Returns:
-        Full URI (e.g., "core://agent")
-    """
-    return f"{domain}://{path}"
 
 
 # =============================================================================
@@ -366,68 +297,9 @@ async def _fetch_and_format_memory(client, uri: str) -> str:
         raise ValueError(f"URI '{make_uri(domain, path)}' not found.")
 
     # Get children across ALL paths (aliases) of this memory.
-    # Once you reach a memory, the sub-memories you see depend on
-    # what the memory IS, not which path you used to get here.
     children = await client.get_children(memory["id"])
 
-    # Format output
-    lines = []
-
-    # Build URI from domain and path
-    disp_domain = memory.get("domain", DEFAULT_DOMAIN)
-    disp_path = memory.get("path", "unknown")
-    disp_uri = make_uri(disp_domain, disp_path)
-
-    # Header Block
-    lines.append("=" * 60)
-    lines.append("")
-    lines.append(f"MEMORY: {disp_uri}")
-    lines.append(f"Memory ID: {memory.get('id')}")
-    lines.append(f"Priority: {memory.get('priority', 0)}")
-
-    disclosure = memory.get("disclosure")
-    if disclosure:
-        lines.append(f"Disclosure: {disclosure}")
-    else:
-        lines.append("Disclosure: (not set)")
-
-    lines.append("")
-    lines.append("=" * 60)
-    lines.append("")
-
-    # Content - directly, no header
-    lines.append(memory.get("content", "(empty)"))
-    lines.append("")
-
-    if children:
-        lines.append("=" * 60)
-        lines.append("")
-        lines.append("CHILD MEMORIES (Use 'read_memory' with URI to access)")
-        lines.append("")
-        lines.append("=" * 60)
-        lines.append("")
-
-        for child in children:
-            child_domain = child.get("domain", disp_domain)
-            child_path = child.get("path", "")
-            child_uri = make_uri(child_domain, child_path)
-
-            # Show disclosure status and snippet
-            child_disclosure = child.get("disclosure")
-            snippet = child.get("content_snippet", "")
-
-            lines.append(f"- URI: {child_uri}  ")
-            lines.append(f"  Priority: {child.get('priority', 0)}  ")
-
-            if child_disclosure:
-                lines.append(f"  When to recall: {child_disclosure}  ")
-            else:
-                lines.append("  When to recall: (not set)  ")
-                lines.append(f"  Snippet: {snippet}  ")
-
-            lines.append("")
-
-    return "\n".join(lines)
+    return view.format_memory(memory, children)
 
 
 async def _generate_boot_memory_view() -> str:
@@ -437,50 +309,26 @@ async def _generate_boot_memory_view() -> str:
     """
     client = get_sqlite_client()
     results = []
-    loaded = 0
     failed = []
 
     for uri in CORE_MEMORY_URIS:
         try:
             content = await _fetch_and_format_memory(client, uri)
             results.append(content)
-            loaded += 1
         except Exception as e:
             # e.g. not found or other error
             failed.append(f"- {uri}: {str(e)}")
 
-    # Build output
-    output_parts = []
-
-    output_parts.append("# Core Memories")
-    output_parts.append(f"# Loaded: {loaded}/{len(CORE_MEMORY_URIS)} memories")
-    output_parts.append("")
-
-    if failed:
-        output_parts.append("## Failed to load:")
-        output_parts.extend(failed)
-        output_parts.append("")
-
-    if results:
-        output_parts.append("## Contents:")
-        output_parts.append("")
-        output_parts.append("For full memory index, use: system://index")
-        output_parts.append("For recent memories, use: system://recent")
-        output_parts.extend(results)
-    else:
-        output_parts.append("(No core memories loaded. Run migration first.)")
-
-    # Append recent memories to boot output so the agent sees what changed recently
+    # Fetch recent memories string
+    recent_view = ""
     try:
         recent_view = await _generate_recent_memories_view(limit=5)
-        output_parts.append("")
-        output_parts.append("---")
-        output_parts.append("")
-        output_parts.append(recent_view)
     except Exception:
         pass  # Non-critical; don't break boot if recent query fails
 
-    return "\n".join(output_parts)
+    return view.format_boot_memory_view(
+        results, failed, recent_view, len(CORE_MEMORY_URIS)
+    )
 
 
 async def _generate_memory_index_view() -> str:
@@ -492,49 +340,7 @@ async def _generate_memory_index_view() -> str:
 
     try:
         paths = await client.get_all_paths()
-
-        lines = []
-        lines.append("# Memory Index")
-        lines.append(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append(f"# Total entries: {len(paths)}")
-        lines.append(
-            "# Legend: [#ID] = Memory ID (same ID = alias), [★N] = priority (lower = higher priority)"
-        )
-        lines.append("")
-
-        # Group by domain first, then by top-level path segment
-        domains = {}
-        for item in paths:
-            domain = item.get("domain", DEFAULT_DOMAIN)
-            if domain not in domains:
-                domains[domain] = {}
-
-            path = item["path"]
-            top_level = path.split("/")[0] if path else "(root)"
-            if top_level not in domains[domain]:
-                domains[domain][top_level] = []
-            domains[domain][top_level].append(item)
-
-        for domain_name in sorted(domains.keys()):
-            lines.append("# ══════════════════════════════════════")
-            lines.append(f"# DOMAIN: {domain_name}://")
-            lines.append("# ══════════════════════════════════════")
-            lines.append("")
-
-            for group_name in sorted(domains[domain_name].keys()):
-                lines.append(f"## {group_name}")
-                for item in sorted(
-                    domains[domain_name][group_name], key=lambda x: x["path"]
-                ):
-                    uri = item.get("uri", make_uri(domain_name, item["path"]))
-                    priority = item.get("priority", 0)
-                    memory_id = item.get("memory_id", "?")
-                    imp_str = f" [★{priority}]" if priority > 0 else ""
-                    lines.append(f"  - {uri} [#{memory_id}]{imp_str}")
-                lines.append("")
-
-        return "\n".join(lines)
-
+        return view.format_memory_index_view(paths)
     except Exception as e:
         return f"Error generating index: {str(e)}"
 
@@ -553,42 +359,7 @@ async def _generate_recent_memories_view(limit: int = 10) -> str:
 
     try:
         results = await client.get_recent_memories(limit=limit)
-
-        lines = []
-        lines.append("# Recently Modified Memories")
-        lines.append(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append(
-            f"# Showing: {len(results)} most recent entries (requested: {limit})"
-        )
-        lines.append("")
-
-        if not results:
-            lines.append("(No memories found.)")
-            return "\n".join(lines)
-
-        for i, item in enumerate(results, 1):
-            uri = item["uri"]
-            priority = item.get("priority", 0)
-            disclosure = item.get("disclosure")
-            raw_ts = item.get("created_at", "")
-
-            # Truncate timestamp to minute precision: "2026-02-09T20:40"
-            if raw_ts and len(raw_ts) >= 16:
-                modified = raw_ts[:10] + " " + raw_ts[11:16]
-            else:
-                modified = raw_ts or "unknown"
-
-            imp_str = f"★{priority}"
-
-            lines.append(f"{i}. {uri}  [{imp_str}]  modified: {modified}")
-            if disclosure:
-                lines.append(f"   disclosure: {disclosure}")
-            else:
-                lines.append("   disclosure: (NOT SET — consider adding one)")
-            lines.append("")
-
-        return "\n".join(lines)
-
+        return view.format_recent_memories_view(results, limit)
     except Exception as e:
         return f"Error generating recent memories view: {str(e)}"
 
@@ -1006,9 +777,9 @@ async def search_memory(
         lines = [f"Found {len(results)} matches for '{query}':", ""]
 
         for item in results:
-            uri = item.get(
-                "uri", make_uri(item.get("domain", DEFAULT_DOMAIN), item["path"])
-            )
+            uri = item.get("uri")
+            if not uri:
+                uri = make_uri(item.get("domain", DEFAULT_DOMAIN), item["path"])
             lines.append(f"- [{item['name']}] {uri}")
             lines.append(f"  Priority: {item['priority']}")
             lines.append(f"  {item['snippet']}")
