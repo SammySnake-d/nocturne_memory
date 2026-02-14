@@ -1,0 +1,16 @@
+
+> memory-reviewer@0.0.0 dev
+> vite
+
+
+  VITE v7.3.0  ready in 241 ms
+
+  ➜  Local:   http://localhost:3000/
+  ➜  Network: use --host to expose
+8:41:51 PM [vite] (client) hmr update /src/index.css, /src/components/SnapshotList.jsx
+8:42:30 PM [vite] (client) hmr update /src/index.css, /src/components/SnapshotList.jsx
+8:42:55 PM [vite] (client) hmr update /src/index.css, /src/components/SnapshotList.jsx
+8:43:27 PM [vite] (client) hmr update /src/index.css, /src/components/SnapshotList.jsx
+8:44:20 PM [vite] (client) hmr update /src/index.css, /src/components/SnapshotList.jsx
+8:45:30 PM [vite] (client) hmr update /src/App.jsx, /src/index.css
+8:45:34 PM [vite] (client) hmr update /src/features/performance/TestPerformancePage.jsx, /src/index.css
