@@ -28,6 +28,9 @@ from sqlalchemy import (
     and_,
     or_,
     literal,
+    text,
+    table,
+    column,
 )
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base, relationship, aliased
@@ -132,6 +135,8 @@ class SQLiteClient:
             await conn.run_sync(Base.metadata.create_all)
             # Migration: add migrated_to column if not present (for existing DBs)
             await conn.run_sync(self._migrate_add_migrated_to)
+            # Migration: create FTS table and triggers
+            await conn.run_sync(self._migrate_create_fts)
 
     @staticmethod
     def _migrate_add_migrated_to(connection):
@@ -143,6 +148,94 @@ class SQLiteClient:
         if "migrated_to" not in columns:
             connection.execute(
                 text("ALTER TABLE memories ADD COLUMN migrated_to INTEGER")
+            )
+
+    @staticmethod
+    def _migrate_create_fts(connection):
+        """Create FTS5 table and triggers for search if they don't exist."""
+        from sqlalchemy import text
+
+        # Create FTS table
+        connection.execute(
+            text(
+                """
+            CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                path,
+                content,
+                domain UNINDEXED
+            )
+        """
+            )
+        )
+
+        # Create triggers to keep FTS in sync with paths/memories
+
+        # 1. Path Insert
+        connection.execute(
+            text(
+                """
+            CREATE TRIGGER IF NOT EXISTS paths_ai AFTER INSERT ON paths BEGIN
+                INSERT INTO memories_fts(rowid, path, content, domain)
+                SELECT new.rowid, new.path, m.content, new.domain
+                FROM memories m WHERE m.id = new.memory_id;
+            END;
+        """
+            )
+        )
+
+        # 2. Path Delete
+        connection.execute(
+            text(
+                """
+            CREATE TRIGGER IF NOT EXISTS paths_ad AFTER DELETE ON paths BEGIN
+                DELETE FROM memories_fts WHERE rowid = old.rowid;
+            END;
+        """
+            )
+        )
+
+        # 3. Path Update
+        connection.execute(
+            text(
+                """
+            CREATE TRIGGER IF NOT EXISTS paths_au AFTER UPDATE ON paths BEGIN
+                UPDATE memories_fts SET
+                    path = new.path,
+                    domain = new.domain,
+                    content = (SELECT content FROM memories WHERE id = new.memory_id)
+                WHERE rowid = new.rowid;
+            END;
+        """
+            )
+        )
+
+        # 4. Memory Update (content only)
+        # We need to update all FTS entries corresponding to paths pointing to this memory
+        connection.execute(
+            text(
+                """
+            CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content ON memories BEGIN
+                UPDATE memories_fts
+                SET content = new.content
+                WHERE rowid IN (SELECT rowid FROM paths WHERE memory_id = new.id);
+            END;
+        """
+            )
+        )
+
+        # Populate FTS if empty (initial migration)
+        count = connection.execute(text("SELECT count(*) FROM memories_fts")).scalar()
+        if count == 0:
+            connection.execute(
+                text(
+                    """
+                INSERT INTO memories_fts(rowid, path, content, domain)
+                SELECT p.rowid, p.path, m.content, p.domain
+                FROM paths p
+                JOIN memories m ON p.memory_id = m.id
+                WHERE m.deprecated = 0
+            """
+                )
             )
 
     async def close(self):
@@ -893,10 +986,13 @@ class SQLiteClient:
         self, query: str, limit: int = 10, domain: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
-        Search memories by path and content.
+        Search memories by path and content using FTS5.
 
         Args:
-            query: Search query (substring match on path segments and content)
+            query: Search query. Supports FTS5 syntax.
+                   Simple words match as tokens.
+                   Use * for prefix search (e.g. "pyth*").
+                   Use "" for phrases.
             limit: Max results
             domain: If specified, only search in this domain.
                     If None, search across all domains.
@@ -905,46 +1001,73 @@ class SQLiteClient:
             List of matching memories with paths
         """
         async with self.session() as session:
-            # Simple LIKE search (can be upgraded to FULLTEXT later)
-            search_pattern = f"%{query}%"
+            # Prepare query: if it's a simple alphanumeric string, append * for prefix matching
+            # to mimic "substring" search behavior for the last word, which is common expectation.
+            # But let's be careful. If user provides explicit syntax, don't mess with it.
+            fts_query = query
+            if query.isalnum():
+                 # "python" -> "python*"
+                 fts_query = f"{query}*"
 
-            base_query = (
-                select(Memory, Path)
-                .join(Path, Memory.id == Path.memory_id)
-                .where(Memory.deprecated == False)
-                .where(
-                    or_(
-                        Path.path.like(search_pattern),
-                        Memory.content.like(search_pattern),
-                    )
+            # Escape double quotes to prevent syntax errors if we were wrapping,
+            # but here we pass raw query mostly.
+            # If query contains special FTS chars that are invalid, it might crash.
+            # Let's assume the user (or MCP agent) provides valid query string.
+            # But for safety, we could wrap in quotes if we wanted exact match.
+            # Given the previous implementation was LIKE %query%, we want broad matching.
+            # The isalnum() check above helps for single words.
+
+            # FTS5 Query
+            # We select Memory, Path, and snippet from FTS
+            # We join FTS (via rowid) to Path (via rowid), then to Memory
+
+            # Define FTS table wrapper for SQLAlchemy to handle it as a selectable
+            memories_fts = table("memories_fts", column("rowid"), column("rank"))
+
+            stmt = (
+                select(
+                    Memory,
+                    Path,
+                    text("snippet(memories_fts, 1, '<b>', '</b>', '...', 64)"),
                 )
+                .select_from(memories_fts)
+                .join(Path, memories_fts.c.rowid == text("paths.rowid"))
+                .join(Memory, Path.memory_id == Memory.id)
+                .where(text("memories_fts MATCH :query"))
+                .where(Memory.deprecated == False)
+                .order_by(memories_fts.c.rank)
+                .limit(limit)
             )
 
             if domain is not None:
-                base_query = base_query.where(Path.domain == domain)
+                stmt = stmt.where(Path.domain == domain)
 
-            # Order by Path.priority
-            base_query = base_query.order_by(Path.priority.asc()).limit(limit)
-            result = await session.execute(base_query)
+            try:
+                result = await session.execute(stmt, {"query": fts_query})
+            except Exception:
+                # If FTS query fails (syntax error), fall back to exact match on the original query
+                # or just fail.
+                # Let's try matching the exact string as a phrase
+                safe_query = f'"{query}"'
+                result = await session.execute(stmt, {"query": safe_query})
 
             matches = []
             seen_ids = set()
 
-            for memory, path_obj in result.all():
+            for row in result.all():
+                # row is (Memory, Path, snippet)
+                memory = row[0]
+                path_obj = row[1]
+                snippet = row[2]
+
                 if memory.id not in seen_ids:
                     seen_ids.add(memory.id)
 
-                    # Find match snippet
-                    content_lower = memory.content.lower()
-                    query_lower = query.lower()
-                    pos = content_lower.find(query_lower)
-
-                    if pos >= 0:
-                        start = max(0, pos - 30)
-                        end = min(len(memory.content), pos + len(query) + 30)
-                        snippet = "..." + memory.content[start:end] + "..."
-                    else:
-                        snippet = memory.content[:80] + "..."
+                    # Clean up snippet if it's just "..." or empty?
+                    # FTS snippet returns "..." if no match in column 1 (content).
+                    # If match was in path (column 0), snippet might be empty for col 1.
+                    if not snippet or snippet == "...":
+                         snippet = memory.content[:80] + "..."
 
                     matches.append(
                         {

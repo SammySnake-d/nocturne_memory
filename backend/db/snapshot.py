@@ -113,8 +113,20 @@ class SnapshotManager:
         # Always append hash to guarantee uniqueness
         return f"{safe_id}_{id_hash}"
     
+    def _validate_session_id(self, session_id: str):
+        """
+        Validate session_id to prevent path traversal.
+        """
+        if not session_id:
+            raise ValueError("Session ID cannot be empty")
+
+        # Check for path traversal characters
+        if ".." in session_id or "/" in session_id or "\\" in session_id:
+            raise ValueError(f"Invalid session ID: {session_id}")
+
     def _get_session_dir(self, session_id: str) -> str:
         """Get the directory path for a session."""
+        self._validate_session_id(session_id)
         return os.path.join(self.snapshot_dir, session_id)
     
     def _get_resources_dir(self, session_id: str) -> str:
@@ -290,7 +302,12 @@ class SnapshotManager:
             return sessions
         
         for session_id in os.listdir(self.snapshot_dir):
-            session_dir = self._get_session_dir(session_id)
+            try:
+                session_dir = self._get_session_dir(session_id)
+            except ValueError:
+                # Skip files/dirs that don't match session_id format
+                continue
+
             if os.path.isdir(session_dir):
                 manifest = self._load_manifest(session_id)
                 resource_count = len(manifest.get("resources", {}))
