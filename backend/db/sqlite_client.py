@@ -27,6 +27,7 @@ from sqlalchemy import (
     func,
     and_,
     or_,
+    union_all,
     text,
     table,
     column,
@@ -290,9 +291,9 @@ class SQLiteClient:
                 "priority": path_obj.priority,  # From Path
                 "disclosure": path_obj.disclosure,  # From Path
                 "deprecated": memory.deprecated,
-                "created_at": memory.created_at.isoformat()
-                if memory.created_at
-                else None,
+                "created_at": (
+                    memory.created_at.isoformat() if memory.created_at else None
+                ),
                 "domain": path_obj.domain,
                 "path": path_obj.path,
             }
@@ -327,9 +328,9 @@ class SQLiteClient:
                 # Priority/Disclosure removed as they are path-dependent
                 "deprecated": memory.deprecated,
                 "migrated_to": memory.migrated_to,
-                "created_at": memory.created_at.isoformat()
-                if memory.created_at
-                else None,
+                "created_at": (
+                    memory.created_at.isoformat() if memory.created_at else None
+                ),
                 "paths": paths,
             }
 
@@ -409,8 +410,8 @@ class SQLiteClient:
         if not parent_paths:
             return []
 
-        # 2. Build OR conditions for children under each parent path
-        child_conditions = []
+        # 2. Build UNION queries for children under each parent path
+        queries = []
         for parent_domain, parent_path in parent_paths:
             safe_parent = (
                 parent_path.replace("\\", "\\\\")
@@ -419,46 +420,59 @@ class SQLiteClient:
             )
             safe_prefix = f"{safe_parent}/"
 
-            child_conditions.append(
-                and_(
-                    Path.domain == parent_domain,
-                    Path.path.like(f"{safe_prefix}%", escape="\\"),
-                    Path.path.not_like(f"{safe_prefix}%/%", escape="\\"),
+            # Subquery for this specific parent path
+            # Select specific columns to avoid ORM object issues in UNION
+            q = (
+                select(
+                    Memory.id,
+                    Memory.content,
+                    Path.domain,
+                    Path.path,
+                    Path.priority,
+                    Path.disclosure,
                 )
+                .join(Path, Memory.id == Path.memory_id)
+                .where(Memory.deprecated == False)
+                .where(Path.domain == parent_domain)
+                .where(Path.path.like(f"{safe_prefix}%", escape="\\"))
+                .where(Path.path.not_like(f"{safe_prefix}%/%", escape="\\"))
             )
+            queries.append(q)
 
-        # 3. Query all children in one shot
-        query = (
-            select(Memory, Path)
-            .join(Path, Memory.id == Path.memory_id)
-            .where(Memory.deprecated == False)
-            .where(or_(*child_conditions))
-            .order_by(Path.priority.asc(), Path.path)
-        )
+        # 3. Query all children using UNION ALL
+        if not queries:
+            return []
 
-        result = await session.execute(query)
+        if len(queries) == 1:
+            stmt = queries[0].order_by(Path.priority.asc(), Path.path)
+        else:
+            # Use subquery to allow proper ordering of union result
+            u = union_all(*queries).subquery()
+            stmt = select(u).order_by(u.c.priority.asc(), u.c.path)
+
+        result = await session.execute(stmt)
 
         # 4. Deduplicate by (domain, path)
         seen = set()
         children = []
-        for memory, path_obj in result.all():
-            key = (path_obj.domain, path_obj.path)
+        for row in result.all():
+            key = (row.domain, row.path)
             if key in seen:
                 continue
             seen.add(key)
 
             children.append(
                 {
-                    "domain": path_obj.domain,
-                    "path": path_obj.path,
-                    "name": path_obj.path.rsplit("/", 1)[-1],
+                    "domain": row.domain,
+                    "path": row.path,
+                    "name": row.path.rsplit("/", 1)[-1],
                     "content_snippet": (
-                        memory.content[:100] + "..."
-                        if len(memory.content) > 100
-                        else memory.content
+                        row.content[:100] + "..."
+                        if len(row.content) > 100
+                        else row.content
                     ),
-                    "priority": path_obj.priority,
-                    "disclosure": path_obj.disclosure,
+                    "priority": row.priority,
+                    "disclosure": row.disclosure,
                 }
             )
 
@@ -674,48 +688,14 @@ class SQLiteClient:
             old_id = old_memory.id
 
             # Update Path Metadata
-            if priority is not None:
-                path_obj.priority = priority
-            if disclosure is not None:
-                path_obj.disclosure = disclosure
+            self._update_metadata(path_obj, priority, disclosure)
 
             new_memory_id = old_id
 
             if content is not None:
-                # Content update requested: ALWAYS create a new version.
-                #
-                # Previously this checked `content != old_memory.content` and
-                # silently skipped when content was identical.  This caused a
-                # TOCTOU bug: the MCP layer reads content in session A, computes
-                # the replacement, then passes it here (session B).  If the DB
-                # content was already updated between the two reads (or if the
-                # MCP transport subtly normalised whitespace), the equality
-                # check would pass, no new version was created, yet "Success"
-                # was returned to the caller.
-                #
-                # The MCP layer is responsible for validating the change; the
-                # DB layer should unconditionally persist whatever it receives.
-                new_memory = Memory(content=content)
-                session.add(new_memory)
-                await session.flush()
-                new_memory_id = new_memory.id
-
-                # Mark old as deprecated and set migration pointer to new version
-                await session.execute(
-                    update(Memory)
-                    .where(Memory.id == old_id)
-                    .values(deprecated=True, migrated_to=new_memory.id)
-                )
-
-                # Repoint ALL paths pointing to the old memory to the new memory
-                # This ensures aliases stay in sync with the content update
-                await session.execute(
-                    update(Path)
-                    .where(Path.memory_id == old_id)
-                    .values(memory_id=new_memory.id)
-                )
-
-            if content is None:
+                new_memory_id = await self._create_new_version(session, content)
+                await self._link_new_version(session, old_id, new_memory_id)
+            else:
                 # Only metadata changed, explicitly add the path object for flush
                 session.add(path_obj)
 
@@ -726,6 +706,53 @@ class SQLiteClient:
                 "old_memory_id": old_id,
                 "new_memory_id": new_memory_id,
             }
+
+    @staticmethod
+    def _update_metadata(
+        path_obj: Path, priority: Optional[int], disclosure: Optional[str]
+    ):
+        """Update path metadata if new values are provided."""
+        if priority is not None:
+            path_obj.priority = priority
+        if disclosure is not None:
+            path_obj.disclosure = disclosure
+
+    @staticmethod
+    async def _create_new_version(session: AsyncSession, content: str) -> int:
+        """Create a new memory version and return its ID."""
+        # Content update requested: ALWAYS create a new version.
+        #
+        # Previously this checked `content != old_memory.content` and
+        # silently skipped when content was identical.  This caused a
+        # TOCTOU bug: the MCP layer reads content in session A, computes
+        # the replacement, then passes it here (session B).  If the DB
+        # content was already updated between the two reads (or if the
+        # MCP transport subtly normalised whitespace), the equality
+        # check would pass, no new version was created, yet "Success"
+        # was returned to the caller.
+        #
+        # The MCP layer is responsible for validating the change; the
+        # DB layer should unconditionally persist whatever it receives.
+        new_memory = Memory(content=content)
+        session.add(new_memory)
+        await session.flush()  # Get the ID
+        return new_memory.id
+
+    @staticmethod
+    async def _link_new_version(session: AsyncSession, old_id: int, new_id: int):
+        """Deprecate old memory, link to new version, and repoint paths."""
+        # Mark old as deprecated and set migration pointer to new version
+        await session.execute(
+            update(Memory)
+            .where(Memory.id == old_id)
+            .values(deprecated=True, migrated_to=new_id)
+        )
+
+        # Repoint ALL paths pointing to the old memory to the new memory
+        # This ensures aliases stay in sync with the content update
+        await session.execute(
+            update(Path).where(Path.memory_id == old_id).values(memory_id=new_id)
+        )
 
     async def rollback_to_memory(
         self, path: str, target_memory_id: int, domain: str = "core"
@@ -897,9 +924,7 @@ class SQLiteClient:
 
             # Block deletion if child paths exist
             safe_path = (
-                path.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
+                path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             )
             child_prefix = f"{safe_path}/"
             child_result = await session.execute(
@@ -919,9 +944,7 @@ class SQLiteClient:
                     .order_by(Path.path)
                     .limit(5)
                 )
-                sample_paths = [
-                    f"{domain}://{row[0]}" for row in sample_result.all()
-                ]
+                sample_paths = [f"{domain}://{row[0]}" for row in sample_result.all()]
                 listing = ", ".join(sample_paths)
                 suffix = f" (and {child_count - 5} more)" if child_count > 5 else ""
                 raise ValueError(
@@ -1139,9 +1162,9 @@ class SQLiteClient:
                         "uri": f"{path_obj.domain}://{path_obj.path}",
                         "priority": path_obj.priority,
                         "disclosure": path_obj.disclosure,
-                        "created_at": memory.created_at.isoformat()
-                        if memory.created_at
-                        else None,
+                        "created_at": (
+                            memory.created_at.isoformat() if memory.created_at else None
+                        ),
                     }
                 )
 
@@ -1181,9 +1204,9 @@ class SQLiteClient:
                 "memory_id": memory.id,
                 "content": memory.content,
                 # Importance/Disclosure removed
-                "created_at": memory.created_at.isoformat()
-                if memory.created_at
-                else None,
+                "created_at": (
+                    memory.created_at.isoformat() if memory.created_at else None
+                ),
                 "deprecated": memory.deprecated,
                 "migrated_to": memory.migrated_to,
                 "paths": paths,
@@ -1208,13 +1231,15 @@ class SQLiteClient:
                 memories.append(
                     {
                         "id": memory.id,
-                        "content_snippet": memory.content[:200] + "..."
-                        if len(memory.content) > 200
-                        else memory.content,
+                        "content_snippet": (
+                            memory.content[:200] + "..."
+                            if len(memory.content) > 200
+                            else memory.content
+                        ),
                         "migrated_to": memory.migrated_to,
-                        "created_at": memory.created_at.isoformat()
-                        if memory.created_at
-                        else None,
+                        "created_at": (
+                            memory.created_at.isoformat() if memory.created_at else None
+                        ),
                     }
                 )
 
@@ -1251,9 +1276,9 @@ class SQLiteClient:
                         if len(memory.content) > 200
                         else memory.content
                     ),
-                    "created_at": memory.created_at.isoformat()
-                    if memory.created_at
-                    else None,
+                    "created_at": (
+                        memory.created_at.isoformat() if memory.created_at else None
+                    ),
                     "deprecated": memory.deprecated,
                     "paths": paths,
                 }
@@ -1289,9 +1314,9 @@ class SQLiteClient:
                         if len(memory.content) > 200
                         else memory.content
                     ),
-                    "created_at": memory.created_at.isoformat()
-                    if memory.created_at
-                    else None,
+                    "created_at": (
+                        memory.created_at.isoformat() if memory.created_at else None
+                    ),
                     "deprecated": True,
                     "migrated_to": memory.migrated_to,
                     "category": "deprecated",
@@ -1329,9 +1354,9 @@ class SQLiteClient:
                             if len(memory.content) > 200
                             else memory.content
                         ),
-                        "created_at": memory.created_at.isoformat()
-                        if memory.created_at
-                        else None,
+                        "created_at": (
+                            memory.created_at.isoformat() if memory.created_at else None
+                        ),
                         "deprecated": False,
                         "migrated_to": memory.migrated_to,
                         "category": "orphaned",
@@ -1368,9 +1393,9 @@ class SQLiteClient:
             detail = {
                 "id": memory.id,
                 "content": memory.content,
-                "created_at": memory.created_at.isoformat()
-                if memory.created_at
-                else None,
+                "created_at": (
+                    memory.created_at.isoformat() if memory.created_at else None
+                ),
                 "deprecated": memory.deprecated,
                 "migrated_to": memory.migrated_to,
                 "category": category,

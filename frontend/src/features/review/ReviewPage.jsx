@@ -272,7 +272,7 @@ function ReviewPage() {
         </div>
 
         {/* Snapshot List */}
-        <div className="flex-1 overflow-y-auto py-2">
+        <div className="flex-1 overflow-hidden py-2 flex flex-col">
             {loading ? (
                 <div className="p-8 flex justify-center">
                     <div className="w-6 h-6 border-2 border-indigo-500/30 border-t-indigo-500 rounded-full animate-spin"></div>
