@@ -27,9 +27,10 @@ from sqlalchemy import (
     func,
     and_,
     or_,
+    literal,
 )
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import declarative_base, relationship, aliased
 from dotenv import load_dotenv, find_dotenv
 
 # Load environment variables
@@ -1093,36 +1094,68 @@ class SQLiteClient:
         The final target is the memory at the end of the chain (migrated_to=NULL).
         Returns None if the chain is broken (missing memory) or too long (cycle).
         """
-        current_id = start_id
-        for _ in range(max_hops):
-            result = await session.execute(
-                select(Memory).where(Memory.id == current_id)
-            )
-            memory = result.scalar_one_or_none()
-            if not memory:
-                return None  # Broken chain
-            if memory.migrated_to is None:
-                # Final target reached
-                paths_result = await session.execute(
-                    select(Path).where(Path.memory_id == memory.id)
-                )
-                paths = [f"{p.domain}://{p.path}" for p in paths_result.scalars().all()]
-                return {
-                    "id": memory.id,
-                    "content": memory.content,
-                    "content_snippet": (
-                        memory.content[:200] + "..."
-                        if len(memory.content) > 200
-                        else memory.content
-                    ),
-                    "created_at": memory.created_at.isoformat()
-                    if memory.created_at
-                    else None,
-                    "deprecated": memory.deprecated,
-                    "paths": paths,
-                }
-            current_id = memory.migrated_to
-        return None  # Chain too long, likely a cycle
+        # Recursive CTE to find the end of the chain
+        # Base case: start with the given id
+        start_cte = select(
+            Memory.id,
+            Memory.migrated_to,
+            Memory.content,
+            Memory.created_at,
+            Memory.deprecated,
+            literal(0).label("hops"),
+        ).where(Memory.id == start_id).cte(recursive=True)
+
+        # Recursive part: join with the next memory in the chain
+        memory_alias = aliased(Memory)
+        recursive_part = select(
+            memory_alias.id,
+            memory_alias.migrated_to,
+            memory_alias.content,
+            memory_alias.created_at,
+            memory_alias.deprecated,
+            (start_cte.c.hops + 1).label("hops"),
+        ).join(
+            start_cte, memory_alias.id == start_cte.c.migrated_to
+        ).where(start_cte.c.hops < max_hops)
+
+        cte = start_cte.union_all(recursive_part)
+
+        # Select the final memory (highest hops)
+        stmt = select(cte).order_by(cte.c.hops.desc()).limit(1)
+
+        result = await session.execute(stmt)
+        row = result.first()
+
+        if not row:
+            return None  # Start ID not found
+
+        # If the last found memory still has a pointer, it means we hit max_hops
+        # or stopped for some other reason without reaching the end.
+        if row.migrated_to is not None:
+            return None
+
+        memory_id = row.id
+
+        # Fetch paths for the final memory
+        paths_result = await session.execute(
+            select(Path).where(Path.memory_id == memory_id)
+        )
+        paths = [f"{p.domain}://{p.path}" for p in paths_result.scalars().all()]
+
+        return {
+            "id": memory_id,
+            "content": row.content,
+            "content_snippet": (
+                row.content[:200] + "..."
+                if len(row.content) > 200
+                else row.content
+            ),
+            "created_at": row.created_at.isoformat()
+            if row.created_at
+            else None,
+            "deprecated": row.deprecated,
+            "paths": paths,
+        }
 
     async def get_all_orphan_memories(self) -> List[Dict[str, Any]]:
         """
