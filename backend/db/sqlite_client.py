@@ -661,48 +661,14 @@ class SQLiteClient:
             old_id = old_memory.id
 
             # Update Path Metadata
-            if priority is not None:
-                path_obj.priority = priority
-            if disclosure is not None:
-                path_obj.disclosure = disclosure
+            self._update_metadata(path_obj, priority, disclosure)
 
             new_memory_id = old_id
 
             if content is not None:
-                # Content update requested: ALWAYS create a new version.
-                #
-                # Previously this checked `content != old_memory.content` and
-                # silently skipped when content was identical.  This caused a
-                # TOCTOU bug: the MCP layer reads content in session A, computes
-                # the replacement, then passes it here (session B).  If the DB
-                # content was already updated between the two reads (or if the
-                # MCP transport subtly normalised whitespace), the equality
-                # check would pass, no new version was created, yet "Success"
-                # was returned to the caller.
-                #
-                # The MCP layer is responsible for validating the change; the
-                # DB layer should unconditionally persist whatever it receives.
-                new_memory = Memory(content=content)
-                session.add(new_memory)
-                await session.flush()
-                new_memory_id = new_memory.id
-
-                # Mark old as deprecated and set migration pointer to new version
-                await session.execute(
-                    update(Memory)
-                    .where(Memory.id == old_id)
-                    .values(deprecated=True, migrated_to=new_memory.id)
-                )
-
-                # Repoint ALL paths pointing to the old memory to the new memory
-                # This ensures aliases stay in sync with the content update
-                await session.execute(
-                    update(Path)
-                    .where(Path.memory_id == old_id)
-                    .values(memory_id=new_memory.id)
-                )
-
-            if content is None:
+                new_memory_id = await self._create_new_version(session, content)
+                await self._link_new_version(session, old_id, new_memory_id)
+            else:
                 # Only metadata changed, explicitly add the path object for flush
                 session.add(path_obj)
 
@@ -713,6 +679,53 @@ class SQLiteClient:
                 "old_memory_id": old_id,
                 "new_memory_id": new_memory_id,
             }
+
+    @staticmethod
+    def _update_metadata(
+        path_obj: Path, priority: Optional[int], disclosure: Optional[str]
+    ):
+        """Update path metadata if new values are provided."""
+        if priority is not None:
+            path_obj.priority = priority
+        if disclosure is not None:
+            path_obj.disclosure = disclosure
+
+    @staticmethod
+    async def _create_new_version(session: AsyncSession, content: str) -> int:
+        """Create a new memory version and return its ID."""
+        # Content update requested: ALWAYS create a new version.
+        #
+        # Previously this checked `content != old_memory.content` and
+        # silently skipped when content was identical.  This caused a
+        # TOCTOU bug: the MCP layer reads content in session A, computes
+        # the replacement, then passes it here (session B).  If the DB
+        # content was already updated between the two reads (or if the
+        # MCP transport subtly normalised whitespace), the equality
+        # check would pass, no new version was created, yet "Success"
+        # was returned to the caller.
+        #
+        # The MCP layer is responsible for validating the change; the
+        # DB layer should unconditionally persist whatever it receives.
+        new_memory = Memory(content=content)
+        session.add(new_memory)
+        await session.flush()  # Get the ID
+        return new_memory.id
+
+    @staticmethod
+    async def _link_new_version(session: AsyncSession, old_id: int, new_id: int):
+        """Deprecate old memory, link to new version, and repoint paths."""
+        # Mark old as deprecated and set migration pointer to new version
+        await session.execute(
+            update(Memory)
+            .where(Memory.id == old_id)
+            .values(deprecated=True, migrated_to=new_id)
+        )
+
+        # Repoint ALL paths pointing to the old memory to the new memory
+        # This ensures aliases stay in sync with the content update
+        await session.execute(
+            update(Path).where(Path.memory_id == old_id).values(memory_id=new_id)
+        )
 
     async def rollback_to_memory(
         self, path: str, target_memory_id: int, domain: str = "core"
