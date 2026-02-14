@@ -1788,61 +1788,102 @@ class Neo4jClient:
                   
             return record["result"]
 
-    def evolve_relationship(
-        self,
+    @staticmethod
+    def _get_relationship_structure_tx(tx, viewer_entity_id: str, target_entity_id: str) -> Dict[str, Any]:
+        """
+        获取两个 Entity 之间的最新关系结构（事务内版本）。
+        """
+        query = """
+            // 直接匹配两组 State 之间的 Direct Edge
+            MATCH (v:State)-[d:DIRECT_EDGE]->(t:State)
+            WHERE v.entity_id = $viewer_entity_id
+              AND t.entity_id = $target_entity_id
+            
+            // 按 Viewer 版本倒序，取最新的那次关系记录
+            WITH v, d, t
+            ORDER BY v.version DESC
+            LIMIT 1
+            
+            // 查找依附于该 DIRECT_EDGE 的 RELAY_EDGEs
+            OPTIONAL MATCH (v)-[r1:RELAY_EDGE]->(relay:State)-[r2:RELAY_EDGE]->(t)
+            WHERE r1.edge_id = r2.edge_id
+              AND r1.parent_direct_edge_id = d.edge_id
+
+            // 先在 WITH 中完成聚合，避免在同一返回列中混用聚合与分组表达式
+            WITH v, d, t,
+                 collect(
+                     CASE WHEN relay IS NOT NULL THEN {
+                         edge_id: r1.edge_id,
+                         state: relay {.*, created_at: toString(relay.created_at)},
+                         relation: relay.name,
+                         inheritable: relay.inheritable
+                     } ELSE NULL END
+                 ) AS relays
+
+            RETURN {
+                viewer_state: {
+                    id: v.id,
+                    version: v.version,
+                    name: v.name,
+                    entity_id: v.entity_id
+                },
+                target_state: {
+                    id: t.id,
+                    version: t.version,
+                    name: t.name,
+                    entity_id: t.entity_id
+                },
+                direct: d {.*, created_at: toString(d.created_at)},
+                relays: relays
+            } as result
+        """
+        result = tx.run(query, viewer_entity_id=viewer_entity_id, target_entity_id=target_entity_id)
+        record = result.single()
+        
+        if not record:
+             return {"direct": None, "relays": []}
+
+        return record["result"]
+
+    @staticmethod
+    def _get_entity_info_basic_tx(tx, entity_id: str) -> Optional[Dict[str, Any]]:
+        """
+        获取实体基本信息（事务内版本）。
+        """
+        basic_result = tx.run("""
+            MATCH (s:State {entity_id: $entity_id})
+            RETURN s.id as state_id, s.version as version, s.content as content,
+                   s.created_at as created_at, s.task_description as task_description,
+                   s.name as name, s.entity_id as entity_id, s.inheritable as inheritable
+            ORDER BY s.version DESC
+            LIMIT 1
+        """, entity_id=entity_id)
+        record = basic_result.single()
+        if record:
+            return {
+                "state_id": record["state_id"],
+                "version": record["version"],
+                "content": record["content"],
+                "created_at": str(record["created_at"]),
+                "task_description": record.get("task_description"),
+                "name": record["name"],
+                "entity_id": record["entity_id"],
+                "inheritable": record["inheritable"],
+            }
+        return None
+
+    @staticmethod
+    def _evolve_relationship_tx(
+        tx,
         viewer_entity_id: str,
         target_entity_id: str,
-        direct_patch: Optional[Dict[str, Any]] = None,
-        chapter_updates: Optional[Dict[str, Dict[str, Any]]] = None,
-        new_chapters: Optional[Dict[str, Dict[str, Any]]] = None,
-        task_description: Optional[str] = None
+        direct_patch: Dict[str, Any],
+        chapter_updates: Dict[str, Dict[str, Any]],
+        new_chapters: Dict[str, Dict[str, Any]],
+        task_description: str
     ) -> Dict[str, Any]:
-        """
-        演化一对 Entity 之间的关系到最新版本，同时可选地更新多个位点的内容。
-        
-        这个函数执行"边搬家"操作：
-        1. 获取当前的关系结构（1跳边 + 所有2跳边）
-        2. Evolve Viewer（创建新版本的 viewer state）
-        3. 创建新的 1跳边 (Direct Edge)（连接到 target 的 CURRENT state）
-        4. 创建新的 chapters（如果有 new_chapters）
-        5. 对于每个现有 chapter：
-           - 如果 chapter_updates 中有更新，先用 update_entity 创建新版本
-           - 然后用 move_relay_edge 迁移到新的位置
-        
-        Args:
-            viewer_entity_id: 观察者 Entity ID
-            target_entity_id: 目标 Entity ID
-            direct_patch: 1跳边 (Direct Edge) 的更新字典，可包含：
-                - content: str (新内容，None 表示保持不变)
-                - relation: str (关系名称，None 表示保持不变)
-                - inheritable: bool (是否可继承，None 表示保持不变)
-            chapter_updates: 要更新的现有 chapter，格式为：
-                {chapter_name: {"content": str (可选), "inheritable": bool (可选)}}
-            new_chapters: 要创建的新 chapter，格式为：
-                {chapter_name: {"content": str, "inheritable": bool (可选，默认 True)}}
-            task_description: 任务描述
-            
-        Raises:
-            ValueError: 如果 viewer 或 target 不存在，或关系不存在
-            
-        Returns:
-            {
-                "viewer_entity_id": str,
-                "target_entity_id": str,
-                "viewer_new_version": int,
-                "viewer_new_state_id": str,
-                "direct_edge_id": str,
-                "created_chapters": List[str],  # 新创建的 chapter 名称列表
-                "updated_chapters": List[str],  # 被更新内容的 chapter 名称列表
-                "migrated_chapters": List[str]  # 所有迁移的 chapter 名称列表
-            }
-        """
-        direct_patch = direct_patch or {}
-        chapter_updates = chapter_updates or {}
-        new_chapters = new_chapters or {}
-        
         # ========== 1. 获取当前关系结构 ==========
-        rel_data = self.get_relationship_structure(viewer_entity_id, target_entity_id)
+        rel_data = Neo4jClient._get_relationship_structure_tx(tx, viewer_entity_id, target_entity_id)
         
         # 验证关系存在
         if not rel_data.get('direct'):
@@ -1851,7 +1892,7 @@ class Neo4jClient:
                 f"Use create_direct_edge first."
             )
         
-        # 获取当前的 direct edge 属性（用于保持不变的情况）
+        # 获取当前的 direct edge 属性
         current_direct = rel_data['direct']
         final_direct_content = direct_patch.get('content') if direct_patch.get('content') is not None else current_direct.get('content', '')
         final_direct_relation = direct_patch.get('relation') if direct_patch.get('relation') is not None else current_direct.get('relation', 'RELATIONSHIP')
@@ -1859,48 +1900,35 @@ class Neo4jClient:
         
         # 获取所有现有的 relay 信息
         existing_relays = rel_data.get('relays', [])
-        # 过滤掉 None 值（collect 可能包含 NULL）
+        # 过滤掉 None 值
         existing_relays = [r for r in existing_relays if r is not None]
         
         # ========== 2. 获取 Viewer 和 Target 的当前状态 ==========
-        viewer_info = self.get_entity_info(
-            viewer_entity_id,
-            include_basic=True,
-            include_history=False,
-            include_edges=False,
-        )
-        viewer_state = viewer_info["basic"] if viewer_info else None
+        viewer_state = Neo4jClient._get_entity_info_basic_tx(tx, viewer_entity_id)
         if not viewer_state:
             raise ValueError(f"Viewer entity '{viewer_entity_id}' not found.")
         
-        target_info = self.get_entity_info(
-            target_entity_id,
-            include_basic=True,
-            include_history=False,
-            include_edges=False,
-        )
-        target_state = target_info["basic"] if target_info else None
+        target_state = Neo4jClient._get_entity_info_basic_tx(tx, target_entity_id)
         if not target_state:
             raise ValueError(f"Target entity '{target_entity_id}' not found.")
         
         # ========== 3. Evolve Viewer（创建新版本） ==========
-        task_desc = task_description or "Relationship evolution"
-        new_viewer_res = self.update_entity(
+        new_viewer_res = Neo4jClient._update_entity_tx(
+            tx,
             viewer_entity_id,
-            new_content=viewer_state['content'],  # 保持 viewer 自身内容不变
-            task_description=task_desc
+            new_content=viewer_state['content'],
+            new_name=None,
+            new_inheritable=None,
+            task_description=task_description
         )
         new_viewer_state_id = new_viewer_res['state_id']
         
         # ========== 3.5 删除旧的 Direct Edge ==========
-        # 必须先删除旧边及其依附的 Relay Edges，才能创建同名的新 Direct Edge。
-        # 我们使用 force=True 来移除旧的 RELAY_EDGE 关系（Chapter State 节点保留），
-        # 随后在步骤 6 中会将这些 Chapter 重新连接到新的 Direct Edge 上。
-        self.delete_direct_edge(viewer_entity_id, target_entity_id, force=True)
+        Neo4jClient._delete_direct_edge_tx(tx, viewer_entity_id, target_entity_id, force=True)
 
         # ========== 4. 创建新的 Direct Edge ==========
-        # 连接 new_viewer_state -> target's CURRENT state
-        direct_res = self.create_direct_edge(
+        direct_res = Neo4jClient._create_direct_edge_tx(
+            tx,
             viewer_entity_id,
             target_entity_id,
             relation=final_direct_relation,
@@ -1912,11 +1940,11 @@ class Neo4jClient:
         # ========== 5. 创建新的 Chapters ==========
         created_chapters = []
         for chapter_name, chapter_data in new_chapters.items():
-            # 只支持完整形式 {chapter_name: {"content": ..., "inheritable": ...}}
             chapter_content = chapter_data.get('content', '')
             chapter_inheritable = chapter_data.get('inheritable', True)
             
-            self.create_relay_edge(
+            Neo4jClient._create_relay_edge_tx(
+                tx,
                 from_entity_id=viewer_entity_id,
                 to_entity_id=target_entity_id,
                 relation=chapter_name,
@@ -1934,37 +1962,33 @@ class Neo4jClient:
             relay_state = relay_info['state']
             chapter_name = relay_state.get('name', '')
             relay_entity_id = relay_state.get('entity_id')
-            
-            # 确定要使用的 relay_state_id
             relay_state_id = relay_state.get('id')
             
-            # 检查是否需要更新这个 chapter
             if chapter_name in chapter_updates:
                 update_data = chapter_updates[chapter_name]
-                
                 new_content = update_data.get('content')
                 new_inheritable = update_data.get('inheritable')
                 
-                # 如果有任何更新，调用 update_entity 创建新版本
                 if new_content is not None or new_inheritable is not None:
-                    # 如果没有提供 new_content，使用当前 content
                     content_to_use = new_content if new_content is not None else relay_state.get('content', '')
                     
-                    update_res = self.update_entity(
+                    update_res = Neo4jClient._update_entity_tx(
+                        tx,
                         relay_entity_id,
                         new_content=content_to_use,
+                        new_name=None,
                         new_inheritable=new_inheritable,
                         task_description=f"Chapter update: {chapter_name}"
                     )
                     relay_state_id = update_res['state_id']
                     updated_chapters.append(chapter_name)
             
-            # 迁移 relay edge 到新的位置
-            self.move_relay_edge(
-                viewer_entity_id,
-                target_entity_id,
-                relay_state_id,
-                parent_edge_id
+            Neo4jClient._move_relay_edge_tx(
+                tx,
+                from_entity_id=viewer_entity_id,
+                to_entity_id=target_entity_id,
+                relay_state_id=relay_state_id,
+                parent_direct_edge_id=parent_edge_id
             )
             migrated_chapters.append(chapter_name)
         
@@ -1978,6 +2002,71 @@ class Neo4jClient:
             "updated_chapters": updated_chapters,
             "migrated_chapters": migrated_chapters
         }
+
+    def evolve_relationship(
+        self,
+        viewer_entity_id: str,
+        target_entity_id: str,
+        direct_patch: Optional[Dict[str, Any]] = None,
+        chapter_updates: Optional[Dict[str, Dict[str, Any]]] = None,
+        new_chapters: Optional[Dict[str, Dict[str, Any]]] = None,
+        task_description: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        演化一对 Entity 之间的关系到最新版本，同时可选地更新多个位点的内容。
+
+        这个函数执行"边搬家"操作：
+        1. 获取当前的关系结构（1跳边 + 所有2跳边）
+        2. Evolve Viewer（创建新版本的 viewer state）
+        3. 创建新的 1跳边 (Direct Edge)（连接到 target 的 CURRENT state）
+        4. 创建新的 chapters（如果有 new_chapters）
+        5. 对于每个现有 chapter：
+           - 如果 chapter_updates 中有更新，先用 update_entity 创建新版本
+           - 然后用 move_relay_edge 迁移到新的位置
+
+        Args:
+            viewer_entity_id: 观察者 Entity ID
+            target_entity_id: 目标 Entity ID
+            direct_patch: 1跳边 (Direct Edge) 的更新字典，可包含：
+                - content: str (新内容，None 表示保持不变)
+                - relation: str (关系名称，None 表示保持不变)
+                - inheritable: bool (是否可继承，None 表示保持不变)
+            chapter_updates: 要更新的现有 chapter，格式为：
+                {chapter_name: {"content": str (可选), "inheritable": bool (可选)}}
+            new_chapters: 要创建的新 chapter，格式为：
+                {chapter_name: {"content": str, "inheritable": bool (可选，默认 True)}}
+            task_description: 任务描述
+
+        Raises:
+            ValueError: 如果 viewer 或 target 不存在，或关系不存在
+
+        Returns:
+            {
+                "viewer_entity_id": str,
+                "target_entity_id": str,
+                "viewer_new_version": int,
+                "viewer_new_state_id": str,
+                "direct_edge_id": str,
+                "created_chapters": List[str],  # 新创建的 chapter 名称列表
+                "updated_chapters": List[str],  # 被更新内容的 chapter 名称列表
+                "migrated_chapters": List[str]  # 所有迁移的 chapter 名称列表
+            }
+        """
+        direct_patch = direct_patch or {}
+        chapter_updates = chapter_updates or {}
+        new_chapters = new_chapters or {}
+        task_description = task_description or "Relationship evolution"
+
+        with self.driver.session() as session:
+            return session.execute_write(
+                self._evolve_relationship_tx,
+                viewer_entity_id,
+                target_entity_id,
+                direct_patch,
+                chapter_updates,
+                new_chapters,
+                task_description
+            )
 
     def find_orphan_states(
         self,
