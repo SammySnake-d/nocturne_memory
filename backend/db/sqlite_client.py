@@ -360,18 +360,24 @@ class SQLiteClient:
         """
         async with self.session() as session:
             if memory_id is None:
-                # Virtual root: return paths with no slashes in the given domain
-                query = (
-                    select(Memory, Path)
-                    .join(Path, Memory.id == Path.memory_id)
-                    .where(Path.domain == domain)
-                    .where(Memory.deprecated == False)
-                    .where(Path.path.not_like("%/%"))
-                    .order_by(Path.priority.asc(), Path.path)
-                )
+                return await self._get_root_children(session, domain)
+            else:
+                return await self._get_memory_children(session, memory_id)
 
-                result = await session.execute(query)
+    async def _get_root_children(
+        self, session: AsyncSession, domain: str
+    ) -> List[Dict[str, Any]]:
+        """Helper to get root-level paths (no slashes) in a domain."""
+        query = (
+            select(Memory, Path)
+            .join(Path, Memory.id == Path.memory_id)
+            .where(Path.domain == domain)
+            .where(Memory.deprecated == False)
+            .where(Path.path.not_like("%/%"))
+            .order_by(Path.priority.asc(), Path.path)
+        )
 
+        result = await session.execute(query)
                 children = []
                 for memory, path_obj in result.all():
                     children.append(
@@ -389,13 +395,102 @@ class SQLiteClient:
                         }
                     )
 
-                return children
+        children = []
+        for memory, path_obj in result.all():
+            children.append(
+                {
+                    "domain": path_obj.domain,
+                    "path": path_obj.path,
+                    "name": path_obj.path.rsplit("/", 1)[-1],
+                    "content_snippet": (
+                        memory.content[:100] + "..."
+                        if len(memory.content) > 100
+                        else memory.content
+                    ),
+                    "priority": path_obj.priority,
+                    "disclosure": path_obj.disclosure,
+                }
+            )
 
-            # --- memory_id provided: find children across all aliases ---
+        return children
 
-            # 1. Find all paths pointing to this memory
-            parent_paths_result = await session.execute(
-                select(Path.domain, Path.path).where(Path.memory_id == memory_id)
+    async def _get_memory_children(
+        self, session: AsyncSession, memory_id: int
+    ) -> List[Dict[str, Any]]:
+        """Helper to get children of a specific memory across all its aliases."""
+        # 1. Find all paths pointing to this memory
+        parent_paths_result = await session.execute(
+            select(Path.domain, Path.path).where(Path.memory_id == memory_id)
+        )
+        parent_paths = parent_paths_result.all()
+
+        if not parent_paths:
+            return []
+
+        # 2. Build UNION queries for children under each parent path
+        queries = []
+        for parent_domain, parent_path in parent_paths:
+            safe_parent = (
+                parent_path.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            safe_prefix = f"{safe_parent}/"
+
+            # Subquery for this specific parent path
+            # Select specific columns to avoid ORM object issues in UNION
+            q = (
+                select(
+                    Memory.id,
+                    Memory.content,
+                    Path.domain,
+                    Path.path,
+                    Path.priority,
+                    Path.disclosure,
+                )
+                .join(Path, Memory.id == Path.memory_id)
+                .where(Memory.deprecated == False)
+                .where(Path.domain == parent_domain)
+                .where(Path.path.like(f"{safe_prefix}%", escape="\\"))
+                .where(Path.path.not_like(f"{safe_prefix}%/%", escape="\\"))
+            )
+            queries.append(q)
+
+        # 3. Query all children using UNION ALL
+        if not queries:
+            return []
+
+        if len(queries) == 1:
+            stmt = queries[0].order_by(Path.priority.asc(), Path.path)
+        else:
+            # Use subquery to allow proper ordering of union result
+            u = union_all(*queries).subquery()
+            stmt = select(u).order_by(u.c.priority.asc(), u.c.path)
+
+        result = await session.execute(stmt)
+
+        # 4. Deduplicate by (domain, path)
+        seen = set()
+        children = []
+        for row in result.all():
+            key = (row.domain, row.path)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            children.append(
+                {
+                    "domain": row.domain,
+                    "path": row.path,
+                    "name": row.path.rsplit("/", 1)[-1],
+                    "content_snippet": (
+                        row.content[:100] + "..."
+                        if len(row.content) > 100
+                        else row.content
+                    ),
+                    "priority": row.priority,
+                    "disclosure": row.disclosure,
+                }
             )
             parent_paths = parent_paths_result.all()
 
@@ -468,7 +563,7 @@ class SQLiteClient:
                     }
                 )
 
-            return children
+        return children
 
     async def get_all_paths(self, domain: Optional[str] = None) -> List[Dict[str, Any]]:
         """
