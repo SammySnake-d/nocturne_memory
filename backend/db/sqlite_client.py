@@ -358,98 +358,111 @@ class SQLiteClient:
         """
         async with self.session() as session:
             if memory_id is None:
-                # Virtual root: return paths with no slashes in the given domain
-                query = (
-                    select(Memory, Path)
-                    .join(Path, Memory.id == Path.memory_id)
-                    .where(Path.domain == domain)
-                    .where(Memory.deprecated == False)
-                    .where(Path.path.not_like("%/%"))
-                    .order_by(Path.priority.asc(), Path.path)
-                )
+                return await self._get_root_children(session, domain)
+            else:
+                return await self._get_memory_children(session, memory_id)
 
-                result = await session.execute(query)
+    async def _get_root_children(
+        self, session: AsyncSession, domain: str
+    ) -> List[Dict[str, Any]]:
+        """Helper to get root-level paths (no slashes) in a domain."""
+        query = (
+            select(Memory, Path)
+            .join(Path, Memory.id == Path.memory_id)
+            .where(Path.domain == domain)
+            .where(Memory.deprecated == False)
+            .where(Path.path.not_like("%/%"))
+            .order_by(Path.priority.asc(), Path.path)
+        )
 
-                children = []
-                for memory, path_obj in result.all():
-                    children.append(
-                        {
-                            "domain": path_obj.domain,
-                            "path": path_obj.path,
-                            "name": path_obj.path.rsplit("/", 1)[-1],
-                            "content_snippet": memory.content[:100] + "..."
-                            if len(memory.content) > 100
-                            else memory.content,
-                            "priority": path_obj.priority,
-                            "disclosure": path_obj.disclosure,
-                        }
-                    )
+        result = await session.execute(query)
 
-                return children
-
-            # --- memory_id provided: find children across all aliases ---
-
-            # 1. Find all paths pointing to this memory
-            parent_paths_result = await session.execute(
-                select(Path.domain, Path.path).where(Path.memory_id == memory_id)
-            )
-            parent_paths = parent_paths_result.all()
-
-            if not parent_paths:
-                return []
-
-            # 2. Build OR conditions for children under each parent path
-            child_conditions = []
-            for parent_domain, parent_path in parent_paths:
-                safe_parent = (
-                    parent_path.replace("\\", "\\\\")
-                    .replace("%", "\\%")
-                    .replace("_", "\\_")
-                )
-                safe_prefix = f"{safe_parent}/"
-
-                child_conditions.append(
-                    and_(
-                        Path.domain == parent_domain,
-                        Path.path.like(f"{safe_prefix}%", escape="\\"),
-                        Path.path.not_like(f"{safe_prefix}%/%", escape="\\"),
-                    )
-                )
-
-            # 3. Query all children in one shot
-            query = (
-                select(Memory, Path)
-                .join(Path, Memory.id == Path.memory_id)
-                .where(Memory.deprecated == False)
-                .where(or_(*child_conditions))
-                .order_by(Path.priority.asc(), Path.path)
-            )
-
-            result = await session.execute(query)
-
-            # 4. Deduplicate by (domain, path)
-            seen = set()
-            children = []
-            for memory, path_obj in result.all():
-                key = (path_obj.domain, path_obj.path)
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                children.append(
-                    {
-                        "domain": path_obj.domain,
-                        "path": path_obj.path,
-                        "name": path_obj.path.rsplit("/", 1)[-1],
-                        "content_snippet": memory.content[:100] + "..."
+        children = []
+        for memory, path_obj in result.all():
+            children.append(
+                {
+                    "domain": path_obj.domain,
+                    "path": path_obj.path,
+                    "name": path_obj.path.rsplit("/", 1)[-1],
+                    "content_snippet": (
+                        memory.content[:100] + "..."
                         if len(memory.content) > 100
-                        else memory.content,
-                        "priority": path_obj.priority,
-                        "disclosure": path_obj.disclosure,
-                    }
-                )
+                        else memory.content
+                    ),
+                    "priority": path_obj.priority,
+                    "disclosure": path_obj.disclosure,
+                }
+            )
 
-            return children
+        return children
+
+    async def _get_memory_children(
+        self, session: AsyncSession, memory_id: int
+    ) -> List[Dict[str, Any]]:
+        """Helper to get children of a specific memory across all its aliases."""
+        # 1. Find all paths pointing to this memory
+        parent_paths_result = await session.execute(
+            select(Path.domain, Path.path).where(Path.memory_id == memory_id)
+        )
+        parent_paths = parent_paths_result.all()
+
+        if not parent_paths:
+            return []
+
+        # 2. Build OR conditions for children under each parent path
+        child_conditions = []
+        for parent_domain, parent_path in parent_paths:
+            safe_parent = (
+                parent_path.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            safe_prefix = f"{safe_parent}/"
+
+            child_conditions.append(
+                and_(
+                    Path.domain == parent_domain,
+                    Path.path.like(f"{safe_prefix}%", escape="\\"),
+                    Path.path.not_like(f"{safe_prefix}%/%", escape="\\"),
+                )
+            )
+
+        # 3. Query all children in one shot
+        query = (
+            select(Memory, Path)
+            .join(Path, Memory.id == Path.memory_id)
+            .where(Memory.deprecated == False)
+            .where(or_(*child_conditions))
+            .order_by(Path.priority.asc(), Path.path)
+        )
+
+        result = await session.execute(query)
+
+        # 4. Deduplicate by (domain, path)
+        seen = set()
+        children = []
+        for memory, path_obj in result.all():
+            key = (path_obj.domain, path_obj.path)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            children.append(
+                {
+                    "domain": path_obj.domain,
+                    "path": path_obj.path,
+                    "name": path_obj.path.rsplit("/", 1)[-1],
+                    "content_snippet": (
+                        memory.content[:100] + "..."
+                        if len(memory.content) > 100
+                        else memory.content
+                    ),
+                    "priority": path_obj.priority,
+                    "disclosure": path_obj.disclosure,
+                }
+            )
+
+        return children
 
     async def get_all_paths(self, domain: Optional[str] = None) -> List[Dict[str, Any]]:
         """
